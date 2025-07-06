@@ -1,5 +1,3 @@
-#nohup uvicorn app:app --host 0.0.0.0 --port 8000 --reload > fastapi.log 2>&1 &
-
 import yfinance as yf
 import pandas as pd
 import ta
@@ -7,9 +5,29 @@ import threading
 import time
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from wcwidth import wcswidth
+from typing import List, Dict, Optional, Any
+from pydantic import BaseModel
 
-# ====== 분석 로직 함수 (기존 동일) ======
+# ==== 데이터 타입 정의 ====
+
+class BacktestEntry(BaseModel):
+    signal_time: str  # 날짜 문자열 ISO 형식
+    signals: List[str]
+    entry_price: float
+    exit_time: str
+    exit_price: float
+    ret: float  # 수익률 (예: 0.05 = 5%)
+
+class TradingSignalResponse(BaseModel):
+    symbol: str
+    latest_price: float
+    latest_date: str
+    signals: List[str]
+    backtest: List[BacktestEntry]
+    mtf_report: List[str]  # 다중 시간대 분석 메시지 배열
+    last_updated: str
+
+# ==== 기존 분석 로직 (get_data, calculate_indicators, detect_signals, analyze_timeframes, backtest_signals 등 동일)
 
 def get_data(symbol, period='5d', interval='1m'):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
@@ -50,23 +68,23 @@ def calculate_indicators(df):
     df['MA20'] = close.rolling(window=20, min_periods=1).mean()
     return df
 
-def detect_signals(df):
+def get_scalar(val):
+    if isinstance(val, (pd.Series, list, tuple)):
+        if len(val) == 1:
+            return val[0]
+        elif hasattr(val, "item"):
+            return val.item()
+        else:
+            return float(val[0])
+    elif hasattr(val, "item"):
+        return val.item()
+    else:
+        return val
+
+def detect_signals(df) -> Dict[str, List[str]]:
     signal_dict = {}
     for i, (idx, row) in enumerate(df.iterrows()):
         signals = []
-        def get_scalar(val):
-            if isinstance(val, (pd.Series, list, tuple)):
-                if len(val) == 1:
-                    return val[0]
-                elif hasattr(val, "item"):
-                    return val.item()
-                else:
-                    return float(val[0])
-            elif hasattr(val, "item"):
-                return val.item()
-            else:
-                return val
-
         close_val = get_scalar(row['Close'])
         rsi_val = get_scalar(row['RSI'])
         macd_val = get_scalar(row['MACD'])
@@ -80,65 +98,49 @@ def detect_signals(df):
             close_prev = get_scalar(df['Close'].iloc[i-1])
             EPS = 1e-8
             if close_prev <= ma20_prev + EPS and close_val > ma20_val + EPS:
-                signals.append("🟢 20MA(20이평) 돌파(매수)")
+                signals.append("20MA 돌파 (매수)")
             elif close_prev >= ma20_prev - EPS and close_val < ma20_val - EPS:
-                signals.append("🔴 20MA(20이평) 이탈(매도)")
+                signals.append("20MA 이탈 (매도)")
 
         if i > 0:
             macd_prev = get_scalar(df['MACD'].iloc[i-1])
             macd_signal_prev = get_scalar(df['MACD_signal'].iloc[i-1])
             macd_slope = macd_val - macd_prev
             if (macd_val > macd_signal_val) and (macd_prev <= macd_signal_prev):
-                if macd_slope < 0.03:
-                    phase = "관망 (약함)"
-                elif macd_slope < 0.08:
-                    phase = "매수 (보통)"
-                else:
-                    phase = "풀매수 (강함)"
-                signals.append(f"🟢 골든크로스 - {phase} [{macd_slope:.4f}]")
+                signals.append("골든크로스 발생")
             if (macd_val < macd_signal_val) and (macd_prev >= macd_signal_prev):
-                if abs(macd_slope) < 0.03:
-                    phase = "관망 (약함)"
-                elif abs(macd_slope) < 0.08:
-                    phase = "매도 (보통)"
-                else:
-                    phase = "풀매도 (강함)"
-                signals.append(f"🔴 데드크로스 - {phase} [{macd_slope:.4f}]")
+                signals.append("데드크로스 발생")
 
         if rsi_val is not None and not pd.isna(rsi_val):
             if rsi_val < 20:
-                signals.append("🔵 극과매도(RSI<20)")
+                signals.append("극과매도 (RSI<20)")
             elif rsi_val < 30:
-                signals.append("🟦 과매도(RSI<30)")
+                signals.append("과매도 (RSI<30)")
             elif rsi_val > 80:
-                signals.append("🟣 극과열(RSI>80)")
+                signals.append("극과열 (RSI>80)")
             elif rsi_val > 70:
-                signals.append("🟨 과열(RSI>70)")
-        if (
-            macd_val is not None and not pd.isna(macd_val)
-            and macd_signal_val is not None and not pd.isna(macd_signal_val)
-        ):
-            pass
-        if (
-            bbl_val is not None and not pd.isna(bbl_val)
-            and bbh_val is not None and not pd.isna(bbh_val)
-        ):
+                signals.append("과열 (RSI>70)")
+
+        if bbl_val is not None and bbh_val is not None and not pd.isna(bbl_val) and not pd.isna(bbh_val):
             if close_val < bbl_val:
-                signals.append("🟫 볼밴 하단이탈")
+                signals.append("볼린저밴드 하단 이탈")
             elif close_val > bbh_val:
-                signals.append("🟧 볼밴 상단이탈")
+                signals.append("볼린저밴드 상단 이탈")
+
         if i > 0:
             prev_min = float(df['Close'].iloc[:i].min())
             prev_max = float(df['Close'].iloc[:i].max())
             if close_val == prev_min:
-                signals.append("🆕 신저가 갱신")
+                signals.append("신저가 갱신")
             if close_val == prev_max:
-                signals.append("🆙 신고가 갱신")
+                signals.append("신고가 갱신")
+
         if signals:
-            signal_dict[idx] = signals
+            # 인덱스(날짜)를 문자열 ISO 형식으로 변환
+            signal_dict[str(idx)] = signals
     return signal_dict
 
-def analyze_timeframes(symbol):
+def analyze_timeframes(symbol) -> List[str]:
     intervals = [
         ('1m', '1분', '5d'),
         ('5m', '5분', '7d'),
@@ -151,7 +153,7 @@ def analyze_timeframes(symbol):
     for intv, name, period in intervals:
         df = get_data(symbol, period=period, interval=intv)
         if df is None or len(df) < 30:
-            result_lines.append(f"📊 [{name}] 데이터 부족")
+            result_lines.append(f"[{name}] 데이터 부족")
             continue
         df = calculate_indicators(df)
         latest = df.iloc[-1]
@@ -165,9 +167,9 @@ def analyze_timeframes(symbol):
             signal_prev = prev['MACD_signal']
             EPS = 1e-5
             if (macd > signal + EPS) and (macd_prev <= signal_prev + EPS):
-                cross_str = "🟢 골든크로스 발생!"
+                cross_str = "골든크로스 발생"
             elif (macd < signal - EPS) and (macd_prev >= signal_prev - EPS):
-                cross_str = "🔴 데드크로스 발생!"
+                cross_str = "데드크로스 발생"
 
             if intv in ['1m', '5m', '60m', '1d']:
                 close = latest['Close']
@@ -175,74 +177,74 @@ def analyze_timeframes(symbol):
                 ma20 = latest['MA20']
                 ma20_prev = prev['MA20']
                 if (close_prev <= ma20_prev + EPS) and (close > ma20 + EPS):
-                    ma20_str = "🟢 20MA 돌파(매수 시그널!)"
+                    ma20_str = "20MA 돌파 (매수)"
                 elif (close_prev >= ma20_prev - EPS) and (close < ma20 - EPS):
-                    ma20_str = "🔴 20MA 이탈(매도 시그널!)"
+                    ma20_str = "20MA 이탈 (매도)"
                 elif close > ma20:
-                    ma20_str = "🟩 20MA 위(강세 유지)"
+                    ma20_str = "20MA 위 (강세 유지)"
                 else:
-                    ma20_str = "🟥 20MA 아래(약세 유지)"
+                    ma20_str = "20MA 아래 (약세 유지)"
 
         rsi = latest['RSI']
         price_now = latest['Close']
-        macd = latest['MACD']
-        signal = latest['MACD_signal']
-        macd_slope = macd - df['MACD'].iloc[-2] if len(df) > 1 else 0
-        bb_mid = (latest['BBH'] + latest['BBL']) / 2 if ('BBH' in df.columns and 'BBL' in df.columns) else None
 
         判 = []
 
         if rsi >= 80:
-            判.append('🟣 극과열')
+            判.append('극과열')
         elif rsi >= 70:
-            判.append('🟨 과열')
+            判.append('과열')
         elif 50 <= rsi < 70:
-            判.append('🟩 약세 조짐')
+            判.append('약세 조짐')
         elif 30 <= rsi < 50:
-            判.append('🟦 약세 구간')
+            判.append('약세 구간')
         elif rsi < 30:
-            判.append('🔵 과매도')
+            判.append('과매도')
         else:
-            判.append(f'⚪ 정상({rsi:.1f})')
+            判.append(f'정상({rsi:.1f})')
 
         try:
             if latest['Close'] > latest['BBH']:
-                判.append('🔺 볼밴 상단 이탈')
+                判.append('볼밴 상단 이탈')
             elif latest['Close'] < latest['BBL']:
-                判.append('🔻 볼밴 하단 이탈')
-            elif bb_mid is not None:
+                判.append('볼밴 하단 이탈')
+            else:
+                bb_mid = (latest['BBH'] + latest['BBL']) / 2
                 if latest['Close'] > bb_mid:
-                    判.append('🔸 볼밴 중앙선 위')
+                    判.append('볼밴 중앙선 위')
                 else:
-                    判.append('🔹 볼밴 중앙선 아래')
+                    判.append('볼밴 중앙선 아래')
         except Exception:
             pass
 
-        macd_signal_diff = abs(macd - signal)
+        macd_signal_diff = abs(latest['MACD'] - latest['MACD_signal'])
         MACD_SIGNAL_THRESHOLD = 0.02
         if macd_signal_diff < MACD_SIGNAL_THRESHOLD:
-            判.append('🔶 조정/관망 (신호 미약)')
+            判.append('조정/관망 (신호 미약)')
         else:
+            macd = latest['MACD']
+            signal = latest['MACD_signal']
+            macd_slope = macd - df['MACD'].iloc[-2] if len(df) > 1 else 0
             if macd > signal and macd > 0 and macd_slope > 0:
-                判.append('📈 확실한 상승 추세')
+                判.append('확실한 상승 추세')
             elif macd < signal and macd < 0 and macd_slope < 0:
-                判.append('📉 확실한 하락 추세')
+                判.append('확실한 하락 추세')
             else:
-                判.append('🔶 조정/관망')
+                判.append('조정/관망')
 
-        판별 = ' + '.join(判) if 判 else '⚪ 관망 또는 판별 불가'
         detail_sig = " ".join([v for v in [cross_str, ma20_str] if v])
         if detail_sig:
-            판별 = detail_sig + " + " + 판별
+            判.insert(0, detail_sig)
 
-        result_lines.append(
-            f"📊 [{name}] RSI: {rsi:.2f}, MACD: {macd:.4f}, Signal: {signal:.4f}, 20MA: {latest['MA20']:.4f}, 현재가: 💵 {price_now:.4f}\n→ 판별: {판별}"
-        )
-    return '\n'.join(result_lines)
+        result_lines.append(f"[{name}] " + " + ".join(判))
 
-def backtest_signals(df, signal_dict, holding_days=5):
+    return result_lines
+
+def backtest_signals(df, signal_dict, holding_days=5) -> pd.DataFrame:
     results = []
     for idx, signals in signal_dict.items():
+        if idx not in df.index:
+            continue
         entry_idx = df.index.get_loc(idx)
         if entry_idx + holding_days >= len(df):
             continue
@@ -255,99 +257,16 @@ def backtest_signals(df, signal_dict, holding_days=5):
             exit_price = float(exit_price.squeeze())
         ret = (exit_price - entry_price) / entry_price
         results.append({
-            'signal_time': idx,
+            'signal_time': idx.isoformat() if hasattr(idx, 'isoformat') else str(idx),
             'signals': signals,
             'entry_price': entry_price,
-            'exit_time': exit_idx,
+            'exit_time': exit_idx.isoformat() if hasattr(exit_idx, 'isoformat') else str(exit_idx),
             'exit_price': exit_price,
             'ret': ret
         })
     return pd.DataFrame(results)
 
-def pad_display_width(s, width):
-    real_width = wcswidth(str(s))
-    pad_len = max(0, width - real_width)
-    return str(s) + " " * pad_len
-
-def make_signal_report(symbol, df, signal_dict, backtest_result):
-    COL_DATE   = 12
-    COL_SIG    = 42
-    COL_ENTRY  = 12
-    COL_EXIT_D = 12
-    COL_EXIT   = 12
-    COL_RET    = 9
-    SEP        = 1
-    TOTAL_W    = COL_DATE + COL_SIG + COL_ENTRY + COL_EXIT_D + COL_EXIT + COL_RET + SEP * 5
-
-    latest_idx = df.index[-1]
-    latest_row = df.iloc[-1]
-    close_val = float(latest_row['Close'])
-
-    lines = []
-    lines.append("="*TOTAL_W)
-    lines.append(f"[{symbol}] {latest_idx:%Y-%m-%d}  |  현재가: {close_val:.2f}")
-    lines.append("-"*TOTAL_W)
-
-    sigs = signal_dict.get(latest_idx, [])
-    sig_icons = []
-    for sig in sigs:
-        if '골든크로스' in sig or '과매도' in sig:
-            sig_icons.append("🟢" if "골든" in sig else "🟦" if "과매도" in sig else "■")
-        elif '데드크로스' in sig or '과열' in sig:
-            sig_icons.append("🔴" if "데드" in sig else "🟨" if "과열" in sig else "□")
-        elif '볼밴 상단 이탈' in sig or '볼밴 상단이탈' in sig:
-            sig_icons.append("🟧")
-        else:
-            sig_icons.append("■")
-    sig_line = "◆ 최신 시그널 : "
-    if sigs:
-        sig_line += " ".join(f"{icon} {sig}" for icon, sig in zip(sig_icons, sigs))
-    else:
-        sig_line += "관망/신호 없음"
-    lines.append(sig_line)
-    lines.append("-"*TOTAL_W)
-
-    header = (
-        pad_display_width("일자", COL_DATE) + " " * SEP +
-        pad_display_width("신호", COL_SIG) + " " * SEP +
-        f"{'진입가':>{COL_ENTRY}}" + " " * SEP +
-        f"{'청산일':>{COL_EXIT_D}}" + " " * SEP +
-        f"{'청산가':>{COL_EXIT}}" + " " * SEP +
-        f"{'수익률':>{COL_RET}}"
-    )
-    lines.append(header)
-
-    if not backtest_result.empty:
-        for _, row in backtest_result.tail(10).iterrows():
-            sigstr = ', '.join(row['signals'])
-            if wcswidth(sigstr) > COL_SIG:
-                w, tmp = 0, ''
-                for ch in sigstr:
-                    w += wcswidth(ch)
-                    if w >= COL_SIG-2: break
-                    tmp += ch
-                sigstr = tmp + '…'
-            date_str = pad_display_width(f"{row['signal_time']:%Y-%m-%d}", COL_DATE)
-            sig_disp = pad_display_width(sigstr, COL_SIG)
-            entry_price = f"{row['entry_price']:{COL_ENTRY}.2f}".rjust(COL_ENTRY)
-            exit_date = f"{row['exit_time']:%Y-%m-%d}".rjust(COL_EXIT_D)
-            exit_price = f"{row['exit_price']:{COL_EXIT}.2f}".rjust(COL_EXIT)
-            ret_str = f"{row['ret']*100:>{COL_RET-1}.2f}%"
-            lines.append(
-                date_str + " " * SEP +
-                sig_disp + " " * SEP +
-                entry_price + " " * SEP +
-                exit_date + " " * SEP +
-                exit_price + " " * SEP +
-                ret_str
-            )
-    lines.append("-"*TOTAL_W)
-    avg_str = f"{backtest_result['ret'].mean()*100:.2f}%" if not backtest_result.empty else "데이터 없음"
-    lines.append(pad_display_width("신호평균수익률", TOTAL_W-13) + f": {avg_str}")
-    lines.append("="*TOTAL_W)
-    return "\n".join(lines)
-
-# ====== 동적 캐싱, 에러 심볼 자동정리 스레드 ======
+# ==== 캐시 및 쓰레드 관리 ====
 
 app = FastAPI()
 app.add_middleware(
@@ -361,7 +280,7 @@ app.add_middleware(
 data_cache = {}
 watched_symbols = set()
 symbol_threads = {}
-CACHE_INTERVAL = 1  # 1초마다
+CACHE_INTERVAL = 1  # 초
 
 def is_valid_data(df):
     return (
@@ -374,31 +293,34 @@ def is_valid_data(df):
 def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
     error_count = 0
-    max_error_count = 5  # 연속 5회 이상 실패시 종료
+    max_error_count = 5  # 연속 실패 5회시 중지
     while True:
         try:
             df = get_data(symbol)
             if not is_valid_data(df):
                 error_count += 1
-                print(f"[{symbol}] 데이터 없음/이상 ({error_count})")
+                print(f"[{symbol}] 데이터 이상/없음 ({error_count})")
                 if error_count >= max_error_count:
-                    print(f"[{symbol}] 5회 연속 실패. 캐싱 중지/심볼 제거")
+                    print(f"[{symbol}] 5회 연속 실패, 캐시 중지")
                     watched_symbols.discard(symbol)
                     symbol_threads.pop(symbol, None)
                     data_cache.pop(symbol, None)
                     break
                 time.sleep(3)
                 continue
-            # 정상 데이터면
             error_count = 0
             df = calculate_indicators(df)
             signal_dict = detect_signals(df)
             backtest_result = backtest_signals(df, signal_dict)
-            result_text = make_signal_report(symbol, df, signal_dict, backtest_result)
             mtf_report = analyze_timeframes(symbol)
+            latest_idx = df.index[-1]
+            latest_row = df.iloc[-1]
             data_cache[symbol] = {
                 "symbol": symbol,
-                "signal_report": result_text,
+                "latest_price": float(latest_row['Close']),
+                "latest_date": str(latest_idx),
+                "signals": signal_dict.get(str(latest_idx), []),
+                "backtest": backtest_result.to_dict(orient='records'),
                 "mtf_report": mtf_report,
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -406,7 +328,7 @@ def update_cache(symbol):
             print(f"[{symbol}] 캐시 갱신 예외: {e}")
             error_count += 1
             if error_count >= max_error_count:
-                print(f"[{symbol}] 5회 연속 예외. 캐싱 중지/심볼 제거")
+                print(f"[{symbol}] 5회 연속 예외, 캐시 중지")
                 watched_symbols.discard(symbol)
                 symbol_threads.pop(symbol, None)
                 data_cache.pop(symbol, None)
@@ -421,10 +343,17 @@ def start_symbol_thread(symbol):
     symbol_threads[symbol] = t
     t.start()
 
-@app.get("/monitor")
+@app.get("/monitor", response_model=TradingSignalResponse)
 def monitor(symbol: str = Query("TQQQ")):
     start_symbol_thread(symbol)
     if symbol in data_cache:
         return data_cache[symbol]
-    else:
-        return {"error": "아직 데이터 없음/잘못된 심볼일 수 있음", "symbol": symbol}
+    return {
+        "symbol": symbol,
+        "latest_price": 0.0,
+        "latest_date": "",
+        "signals": [],
+        "backtest": [],
+        "mtf_report": ["데이터 없음 또는 잘못된 심볼"],
+        "last_updated": "",
+    }
