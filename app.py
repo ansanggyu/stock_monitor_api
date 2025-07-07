@@ -5,12 +5,13 @@ import threading
 import time
 import json
 import asyncio
-from typing import List, Dict, Any, Optional
+
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict
 from pydantic import BaseModel
 
-# ====== 데이터 타입 ======
+# ==== 데이터 타입 정의 ====
 
 class BacktestEntry(BaseModel):
     signal_time: str
@@ -29,7 +30,7 @@ class TradingSignalResponse(BaseModel):
     mtf_report: List[str]
     last_updated: str
 
-# ====== FastAPI 세팅 ======
+# ==== 데이터 관리 ====
 
 app = FastAPI()
 app.add_middleware(
@@ -40,15 +41,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ====== 전역 데이터 ======
-data_cache: Dict[str, Any] = {}
+data_cache = {}
 watched_symbols = set()
 symbol_threads = {}
 CACHE_INTERVAL = 1  # 초
 
-# ====== 유틸 ======
-
-def is_valid_data(df: pd.DataFrame) -> bool:
+def is_valid_data(df):
     return (
         df is not None and not df.empty
         and "Close" in df.columns
@@ -56,10 +54,7 @@ def is_valid_data(df: pd.DataFrame) -> bool:
         and df['Close'].mean() > 0
     )
 
-def update_cache(symbol: str):
-    """
-    각 심볼마다 쓰레드로 동작. yfinance -> signal 분석 -> cache 갱신.
-    """
+def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
     error_count = 0
     max_error_count = 5
@@ -100,10 +95,7 @@ def update_cache(symbol: str):
                 break
         time.sleep(CACHE_INTERVAL)
 
-def start_symbol_thread(symbol: str):
-    """
-    해당 symbol 데이터 감시 쓰레드가 없으면 새로 시작.
-    """
+def start_symbol_thread(symbol):
     if symbol in watched_symbols:
         return
     watched_symbols.add(symbol)
@@ -111,13 +103,10 @@ def start_symbol_thread(symbol: str):
     symbol_threads[symbol] = t
     t.start()
 
-# ====== REST API 엔드포인트 ======
+# ==== REST 엔드포인트 ====
 
 @app.get("/monitor", response_model=TradingSignalResponse)
 def monitor(symbol: str = Query("TQQQ")):
-    """
-    특정 심볼의 최신 신호/데이터를 반환.
-    """
     start_symbol_thread(symbol)
     if symbol in data_cache:
         return data_cache[symbol]
@@ -131,42 +120,37 @@ def monitor(symbol: str = Query("TQQQ")):
         "last_updated": "",
     }
 
-# ====== WebSocket ConnectionManager ======
+# ==== WebSocket 엔드포인트 ==== 
 
 class ConnectionManager:
-    """
-    심볼별 접속 관리.
-    """
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, symbol: str):
         await websocket.accept()
-        self.active_connections.setdefault(symbol, []).append(websocket)
+        if symbol not in self.active_connections:
+            self.active_connections[symbol] = []
+        self.active_connections[symbol].append(websocket)
 
     def disconnect(self, websocket: WebSocket, symbol: str):
         if symbol in self.active_connections:
-            try:
-                self.active_connections[symbol].remove(websocket)
-            except ValueError:
-                pass
+            self.active_connections[symbol].remove(websocket)
             if not self.active_connections[symbol]:
                 del self.active_connections[symbol]
 
     async def broadcast(self, symbol: str, data: dict):
-        for ws in list(self.active_connections.get(symbol, [])):
-            try:
-                await ws.send_text(json.dumps(data))
-            except Exception:
-                self.disconnect(ws, symbol)
+        if symbol in self.active_connections:
+            for ws in list(self.active_connections[symbol]):
+                try:
+                    await ws.send_text(json.dumps(data))
+                except Exception:
+                    self.disconnect(ws, symbol)
 
 manager = ConnectionManager()
 
-# ====== WebSocket 엔드포인트 ======
-
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket):
-    # symbol 파라미터 직접 파싱
+    # 쿼리스트링에서 symbol 파싱 (중요!)
     symbol = websocket.query_params.get("symbol", "TQQQ")
     await manager.connect(websocket, symbol)
     start_symbol_thread(symbol)
@@ -181,5 +165,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_sent = current
     except WebSocketDisconnect:
         manager.disconnect(websocket, symbol)
-    except Exception:
+    except Exception as e:
         manager.disconnect(websocket, symbol)
+
+# ==== 여기에 get_data, calculate_indicators, detect_signals, backtest_signals, analyze_timeframes 함수 구현 (생략 가능) ====
+
+# 예시 (구현 이미 있다면 생략):
+def get_data(symbol): pass
+def calculate_indicators(df): pass
+def detect_signals(df): pass
+def backtest_signals(df, signal_dict): return pd.DataFrame()
+def analyze_timeframes(symbol): return []
+
+# -------- END --------
