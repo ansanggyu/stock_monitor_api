@@ -208,22 +208,24 @@ symbol_threads: Dict[str, threading.Thread] = {}
 
 def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
-    #print(f"[update_cache] 쓰레드 시작: {symbol}")
     error_count = 0
     max_error_count = 3
     last_cache = None
     while symbol in watched_symbols:
-        #print(f"[update_cache] {symbol}: get_data() 호출")
         try:
+            print(f"[{symbol}] get_data() 시작 ({time.strftime('%H:%M:%S')})")
             df = get_data(symbol, period="3d", interval="1m")
-            print(f"[update_cache] {symbol}: df shape: {df.shape}")
+            print(f"[{symbol}] get_data() 완료: df shape = {df.shape}")
             if not is_valid_data(df):
-                print(f"[update_cache] {symbol}: 데이터 유효하지 않음")
+                print(f"[{symbol}] 데이터 유효하지 않음. error_count={error_count+1}")
                 error_count += 1
                 time.sleep(0.01)
                 continue
             error_count = 0
+
             df = calculate_indicators(df)
+            print(f"[{symbol}] 지표 계산 완료")
+
             signal_dict = detect_signals(df)
             backtest_result = backtest_signals(df, signal_dict)
             mtf_report = analyze_timeframes(symbol)
@@ -240,6 +242,8 @@ def update_cache(symbol):
             }
             data_cache[symbol] = current_cache
             last_cache = current_cache
+            print(f"[{symbol}] cache update: {current_cache['last_updated']} / {current_cache['latest_price']}")
+
         except Exception as e:
             print(f"[update_cache] {symbol}: 예외 발생: {e}")
             error_count += 1
@@ -250,6 +254,7 @@ def update_cache(symbol):
             print(f"[update_cache] {symbol}: 에러 카운트 초과, 감시 중단")
             break
         time.sleep(0.01)
+
 
 def start_symbol_thread(symbol):
     if symbol in watched_symbols:
