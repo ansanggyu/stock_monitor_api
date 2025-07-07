@@ -208,12 +208,12 @@ symbol_threads: Dict[str, threading.Thread] = {}
 
 def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
-    print(f"[update_cache] 쓰레드 시작: {symbol}")
+    #print(f"[update_cache] 쓰레드 시작: {symbol}")
     error_count = 0
     max_error_count = 3
     last_cache = None
     while symbol in watched_symbols:
-        print(f"[update_cache] {symbol}: get_data() 호출")
+        #print(f"[update_cache] {symbol}: get_data() 호출")
         try:
             df = get_data(symbol, period="3d", interval="1m")
             print(f"[update_cache] {symbol}: df shape: {df.shape}")
@@ -238,9 +238,8 @@ def update_cache(symbol):
                 "mtf_report": mtf_report,
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            if current_cache != last_cache:
-                data_cache[symbol] = current_cache
-                last_cache = current_cache
+            data_cache[symbol] = current_cache
+            last_cache = current_cache
         except Exception as e:
             print(f"[update_cache] {symbol}: 예외 발생: {e}")
             error_count += 1
