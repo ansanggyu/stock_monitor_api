@@ -166,9 +166,7 @@ manager = ConnectionManager()
 
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    쿼리스트링 symbol 파라미터 사용 (ex: /ws/monitor?symbol=TQQQ)
-    """
+    # symbol 파라미터 직접 파싱
     symbol = websocket.query_params.get("symbol", "TQQQ")
     await manager.connect(websocket, symbol)
     start_symbol_thread(symbol)
