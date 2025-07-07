@@ -128,11 +128,17 @@ def analyze_timeframes(symbol: str) -> List[str]:
     return reports
 
 def is_valid_data(df):
+    # 디버깅용 로그 (원인 추적)
+    print("[is_valid_data] df is None:", df is None)
+    print("[is_valid_data] df is empty:", df.empty if df is not None else "N/A")
+    print("[is_valid_data] 'Close' in columns:", "Close" in df.columns if df is not None else "N/A")
+    print("[is_valid_data] Close notnull any:", df['Close'].notnull().any() if (df is not None and "Close" in df.columns) else "N/A")
+    print("[is_valid_data] Close > 0 any:", (df['Close'] > 0).any() if (df is not None and "Close" in df.columns) else "N/A")
     return (
         df is not None and not df.empty
         and "Close" in df.columns
         and df['Close'].notnull().any()
-        and (df['Close'] > 0).any()
+        and (df['Close'] > 0).any()  # 이 부분이 핵심!
     )
 
 # ==== 서버, 캐시, 쓰레드, 관리자 ====
@@ -164,6 +170,7 @@ def update_cache(symbol):
                 error_count += 1
                 time.sleep(3)
                 continue
+            print(f"[update_cache] {symbol}: 데이터 유효! 캐시 저장 시작")
             error_count = 0
             df = calculate_indicators(df)
             signal_dict = detect_signals(df)
@@ -184,14 +191,15 @@ def update_cache(symbol):
             if current_cache != last_cache:
                 data_cache[symbol] = current_cache
                 last_cache = current_cache
+                print(f"[update_cache] {symbol}: 캐시 저장 완료")
         except Exception as e:
             print(f"[update_cache] {symbol}: 예외 발생: {e}")
             error_count += 1
         if error_count >= max_error_count:
+            print(f"[update_cache] {symbol}: 에러 카운트 초과, 감시 중단")
             watched_symbols.discard(symbol)
             symbol_threads.pop(symbol, None)
             data_cache.pop(symbol, None)
-            print(f"[update_cache] {symbol}: 에러 카운트 초과, 감시 중단")
             break
         time.sleep(10)
 
