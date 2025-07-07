@@ -30,12 +30,15 @@ class TradingSignalResponse(BaseModel):
 
 # ==== 분석 함수 ====
 def get_data(symbol: str) -> pd.DataFrame:
-    # Yahoo 정책상 1m interval은 7일 이하만 지원
     try:
         df = yf.download(symbol, period="7d", interval="1m", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.xs(symbol, axis=1, level=1)
+        df = df.rename_axis("Datetime").reset_index().set_index("Datetime")
     except Exception as e:
         print(f"[get_data] Error for {symbol}: {e}")
         df = pd.DataFrame()
+    print("[get_data] 최종 df.columns:", df.columns)
     return df
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,17 +131,12 @@ def analyze_timeframes(symbol: str) -> List[str]:
     return reports
 
 def is_valid_data(df):
-    # 디버깅용 로그 (원인 추적)
-    print("[is_valid_data] df is None:", df is None)
-    print("[is_valid_data] df is empty:", df.empty if df is not None else "N/A")
-    print("[is_valid_data] 'Close' in columns:", "Close" in df.columns if df is not None else "N/A")
-    print("[is_valid_data] Close notnull any:", df['Close'].notnull().any() if (df is not None and "Close" in df.columns) else "N/A")
-    print("[is_valid_data] Close > 0 any:", (df['Close'] > 0).any() if (df is not None and "Close" in df.columns) else "N/A")
+    print("[is_valid_data] df.columns:", df.columns)
     return (
         df is not None and not df.empty
         and "Close" in df.columns
         and df['Close'].notnull().any()
-        and (df['Close'] > 0).any()  # 이 부분이 핵심!
+        and (df['Close'] > 0).any()
     )
 
 # ==== 서버, 캐시, 쓰레드, 관리자 ====
