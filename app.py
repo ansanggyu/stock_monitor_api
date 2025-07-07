@@ -38,7 +38,7 @@ def fix_df_columns(df, symbol):
     df = df.rename(columns=rename_dict)
     return df
 
-def get_data(symbol: str, period="3d", interval="1m") -> pd.DataFrame:
+def get_data(symbol: str, period="5d", interval="1m") -> pd.DataFrame:
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
         if df is None or df.empty:
@@ -215,12 +215,12 @@ def update_cache(symbol):
     while symbol in watched_symbols:
         print(f"[update_cache] {symbol}: get_data() 호출")
         try:
-            df = get_data(symbol, period="7d", interval="1m")
+            df = get_data(symbol, period="3d", interval="1m")
             print(f"[update_cache] {symbol}: df shape: {df.shape}")
             if not is_valid_data(df):
                 print(f"[update_cache] {symbol}: 데이터 유효하지 않음")
                 error_count += 1
-                time.sleep(1)
+                time.sleep(0.01)
                 continue
             error_count = 0
             df = calculate_indicators(df)
@@ -250,7 +250,7 @@ def update_cache(symbol):
             data_cache.pop(symbol, None)
             print(f"[update_cache] {symbol}: 에러 카운트 초과, 감시 중단")
             break
-        time.sleep(0.001)
+        time.sleep(0.01)
 
 def start_symbol_thread(symbol):
     if symbol in watched_symbols:
@@ -329,7 +329,7 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "TQQQ"):
             await websocket.send_text(json.dumps(data_cache[symbol]))
         last_sent = json.dumps(data_cache[symbol]) if symbol in data_cache else None
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.01)
             if symbol in data_cache:
                 current = json.dumps(data_cache[symbol], sort_keys=True)
                 if current != last_sent:
