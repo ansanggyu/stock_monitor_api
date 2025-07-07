@@ -101,7 +101,6 @@ def backtest_signals(df: pd.DataFrame, signals: Dict[str, List[str]]) -> pd.Data
     return pd.DataFrame(result)
 
 def analyze_timeframes(symbol: str) -> List[str]:
-    """간단 예시: 여러 interval에서 신호 뽑기"""
     intervals = [("1m", "1일"), ("5m", "5일"), ("15m", "10일")]
     reports = []
     for interval, label in intervals:
@@ -144,6 +143,7 @@ def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
     error_count = 0
     max_error_count = 3
+    last_cache = None
     while symbol in watched_symbols:
         try:
             df = get_data(symbol)
@@ -158,7 +158,7 @@ def update_cache(symbol):
             mtf_report = analyze_timeframes(symbol)
             latest_idx = df.index[-1]
             latest_row = df.iloc[-1]
-            data_cache[symbol] = {
+            current_cache = {
                 "symbol": symbol,
                 "latest_price": float(latest_row['Close']),
                 "latest_date": str(latest_idx),
@@ -167,6 +167,10 @@ def update_cache(symbol):
                 "mtf_report": mtf_report,
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
+            # 변경 사항이 있을 때만 data_cache 갱신
+            if current_cache != last_cache:
+                data_cache[symbol] = current_cache
+                last_cache = current_cache
         except Exception as e:
             error_count += 1
         if error_count >= max_error_count:
@@ -221,16 +225,19 @@ def remove_symbol(symbol: str):
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
+
     async def connect(self, websocket: WebSocket, symbol: str):
         await websocket.accept()
         if symbol not in self.active_connections:
             self.active_connections[symbol] = []
         self.active_connections[symbol].append(websocket)
+
     def disconnect(self, websocket: WebSocket, symbol: str):
         if symbol in self.active_connections:
             self.active_connections[symbol].remove(websocket)
             if not self.active_connections[symbol]:
                 del self.active_connections[symbol]
+
     async def broadcast(self, symbol: str, data: dict):
         if symbol in self.active_connections:
             for ws in list(self.active_connections[symbol]):
@@ -246,7 +253,10 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "TQQQ"):
     await manager.connect(websocket, symbol)
     try:
         start_symbol_thread(symbol)
-        last_sent = None
+        # 1. 최초 연결시 현재 데이터가 있으면 바로 전송
+        if symbol in data_cache:
+            await websocket.send_text(json.dumps(data_cache[symbol]))
+        last_sent = json.dumps(data_cache[symbol]) if symbol in data_cache else None
         while True:
             await asyncio.sleep(2)
             if symbol in data_cache:
