@@ -132,7 +132,7 @@ def is_valid_data(df):
         df is not None and not df.empty
         and "Close" in df.columns
         and df['Close'].notnull().any()
-        and df['Close'].mean() > 0
+        and (df['Close'] > 0).any()
     )
 
 # ==== 서버, 캐시, 쓰레드, 관리자 ====
