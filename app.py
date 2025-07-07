@@ -3,14 +3,14 @@ import pandas as pd
 import ta
 import threading
 import time
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+import asyncio
+import json
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
-import asyncio
-import json
 
-# ======== 데이터 타입 정의 ========
+# ==== 데이터 타입 정의 ====
 class BacktestEntry(BaseModel):
     signal_time: str
     signals: List[str]
@@ -28,78 +28,96 @@ class TradingSignalResponse(BaseModel):
     mtf_report: List[str]
     last_updated: str
 
-# ======== 분석 함수 (간단 예시, 실제 분석 함수는 이전 코드 참고) ========
+# ==== 분석 함수 ====
 def get_data(symbol: str) -> pd.DataFrame:
-    df = yf.download(symbol, period="7d", interval="1m")
+    df = yf.download(symbol, period="10d", interval="1m", progress=False)
     return df
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # RSI, MACD 등 계산
-    if "Close" not in df:
+    if df.empty or "Close" not in df.columns:
         return df
-    df = df.copy()
-    df["rsi"] = ta.momentum.rsi(df["Close"], window=14)
-    macd = ta.trend.macd_diff(df["Close"])
-    df["macd"] = macd
-    df["20ma"] = df["Close"].rolling(window=20).mean()
+    df["rsi"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    df["macd"] = ta.trend.MACD(df["Close"]).macd()
+    df["macd_signal"] = ta.trend.MACD(df["Close"]).macd_signal()
+    df["ma20"] = df["Close"].rolling(20).mean()
+    df["bb_upper"] = ta.volatility.BollingerBands(df["Close"]).bollinger_hband()
+    df["bb_lower"] = ta.volatility.BollingerBands(df["Close"]).bollinger_lband()
     return df
 
 def detect_signals(df: pd.DataFrame) -> Dict[str, List[str]]:
-    signals = {}
-    for i in range(1, len(df)):
-        idx = df.index[i]
-        row = df.iloc[i]
-        row_prev = df.iloc[i-1]
+    result = {}
+    for idx, row in df.iterrows():
         sigs = []
-        if row["Close"] > row["20ma"] and row_prev["Close"] <= row_prev["20ma"]:
-            sigs.append("20MA 돌파 (매수)")
-        if row["Close"] < row["20ma"] and row_prev["Close"] >= row_prev["20ma"]:
-            sigs.append("20MA 이탈 (매도)")
-        if row["rsi"] is not None and row["rsi"] > 70:
+        # RSI
+        if row.get("rsi", 50) > 70:
             sigs.append("과열 (RSI>70)")
-        if row["rsi"] is not None and row["rsi"] < 30:
-            sigs.append("침체 (RSI<30)")
+        elif row.get("rsi", 50) < 30:
+            sigs.append("과매도 (RSI<30)")
+        # MACD
+        if row.get("macd", 0) > row.get("macd_signal", 0):
+            sigs.append("MACD 골든크로스")
+        elif row.get("macd", 0) < row.get("macd_signal", 0):
+            sigs.append("MACD 데드크로스")
+        # MA20 돌파/이탈
+        close = row.get("Close", 0)
+        ma20 = row.get("ma20", 0)
+        if pd.notna(ma20):
+            if close > ma20:
+                sigs.append("20MA 돌파 (매수)")
+            elif close < ma20:
+                sigs.append("20MA 이탈 (매도)")
+        # 볼밴 상하단
+        if close > row.get("bb_upper", 0):
+            sigs.append("볼린저밴드 상단 이탈")
+        if close < row.get("bb_lower", 0):
+            sigs.append("볼린저밴드 하단 이탈")
         if sigs:
-            signals[str(idx)] = sigs
-    return signals
+            result[str(idx)] = sigs
+    return result
 
-def backtest_signals(df: pd.DataFrame, signal_dict: Dict[str, List[str]]) -> pd.DataFrame:
-    # 매우 단순 예시: 각 신호 발생시점 진입가/청산가를 기록
-    results = []
-    for t, sigs in signal_dict.items():
-        entry_idx = df.index.get_loc(pd.Timestamp(t))
-        entry_price = df.iloc[entry_idx]["Close"]
-        exit_idx = min(entry_idx + 5, len(df)-1)
-        exit_price = df.iloc[exit_idx]["Close"]
-        ret = (exit_price - entry_price) / entry_price
-        results.append({
-            "signal_time": str(df.index[entry_idx]),
-            "signals": sigs,
-            "entry_price": float(entry_price),
-            "exit_time": str(df.index[exit_idx]),
-            "exit_price": float(exit_price),
-            "ret": float(ret)
+def backtest_signals(df: pd.DataFrame, signals: Dict[str, List[str]]) -> pd.DataFrame:
+    result = []
+    df = df.copy()
+    for idx in signals.keys():
+        i = df.index.get_loc(pd.Timestamp(idx))
+        entry = df.iloc[i]
+        entry_price = entry["Close"]
+        entry_time = idx
+        signal_list = signals[idx]
+        # 단순: 5분 후 청산, 수익률 계산
+        exit_i = i+5 if i+5 < len(df) else len(df)-1
+        exit = df.iloc[exit_i]
+        exit_price = exit["Close"]
+        exit_time = str(exit.name)
+        ret = (exit_price - entry_price) / entry_price if entry_price else 0
+        result.append({
+            "signal_time": entry_time,
+            "signals": signal_list,
+            "entry_price": entry_price,
+            "exit_time": exit_time,
+            "exit_price": exit_price,
+            "ret": ret
         })
-    return pd.DataFrame(results)
+    return pd.DataFrame(result)
 
 def analyze_timeframes(symbol: str) -> List[str]:
-    # 다중타임프레임 보고서 예시 (임의)
-    return [f"[{symbol}] 1분봉 강세", f"[{symbol}] 5분봉 약세"]
-
-# ======== 서버/캐시/쓰레드 관리 ========
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-data_cache = {}
-watched_symbols = set()
-symbol_threads = {}
-CACHE_INTERVAL = 10  # 초
+    """간단 예시: 여러 interval에서 신호 뽑기"""
+    intervals = [("1m", "1일"), ("5m", "5일"), ("15m", "10일")]
+    reports = []
+    for interval, label in intervals:
+        try:
+            df = yf.download(symbol, period="5d", interval=interval, progress=False)
+            df = calculate_indicators(df)
+            sig = detect_signals(df)
+            last_dt = str(df.index[-1]) if not df.empty else "?"
+            if sig:
+                last_sig = list(sig.values())[-1]
+                reports.append(f"[{label}] {','.join(last_sig)} ({last_dt})")
+            else:
+                reports.append(f"[{label}] 신호 없음")
+        except Exception as e:
+            reports.append(f"[{label}] 에러: {e}")
+    return reports
 
 def is_valid_data(df):
     return (
@@ -109,20 +127,28 @@ def is_valid_data(df):
         and df['Close'].mean() > 0
     )
 
+# ==== 서버, 캐시, 쓰레드, 관리자 ====
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+MAX_WATCH = 5
+data_cache: Dict[str, dict] = {}
+watched_symbols: set = set()
+symbol_threads: Dict[str, threading.Thread] = {}
+
 def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
     error_count = 0
-    max_error_count = 5
+    max_error_count = 3
     while symbol in watched_symbols:
         try:
             df = get_data(symbol)
             if not is_valid_data(df):
                 error_count += 1
-                if error_count >= max_error_count:
-                    watched_symbols.discard(symbol)
-                    symbol_threads.pop(symbol, None)
-                    data_cache.pop(symbol, None)
-                    break
                 time.sleep(3)
                 continue
             error_count = 0
@@ -143,76 +169,68 @@ def update_cache(symbol):
             }
         except Exception as e:
             error_count += 1
-            if error_count >= max_error_count:
-                watched_symbols.discard(symbol)
-                symbol_threads.pop(symbol, None)
-                data_cache.pop(symbol, None)
-                break
-        time.sleep(CACHE_INTERVAL)
+        if error_count >= max_error_count:
+            watched_symbols.discard(symbol)
+            symbol_threads.pop(symbol, None)
+            data_cache.pop(symbol, None)
+            break
+        time.sleep(10)
 
 def start_symbol_thread(symbol):
     if symbol in watched_symbols:
         return
+    if len(watched_symbols) >= MAX_WATCH:
+        raise HTTPException(429, f"최대 {MAX_WATCH}개 심볼만 감시 가능합니다")
     watched_symbols.add(symbol)
     t = threading.Thread(target=update_cache, args=(symbol,), daemon=True)
     symbol_threads[symbol] = t
     t.start()
 
-def stop_symbol_thread(symbol):
-    watched_symbols.discard(symbol)
-    if symbol in symbol_threads:
-        symbol_threads.pop(symbol, None)
-    if symbol in data_cache:
-        data_cache.pop(symbol, None)
-
-# ======== REST API ========
+# ==== REST API ====
 @app.get("/monitor", response_model=TradingSignalResponse)
 def monitor(symbol: str = Query("TQQQ")):
     start_symbol_thread(symbol)
     if symbol in data_cache:
         return data_cache[symbol]
     return {
-        "symbol": symbol,
-        "latest_price": 0.0,
-        "latest_date": "",
-        "signals": [],
-        "backtest": [],
-        "mtf_report": ["데이터 없음 또는 잘못된 심볼"],
-        "last_updated": "",
+        "symbol": symbol, "latest_price": 0.0, "latest_date": "",
+        "signals": [], "backtest": [], "mtf_report": ["데이터 없음 또는 잘못된 심볼"], "last_updated": ""
     }
 
 @app.get("/monitors")
 def monitors():
-    # 현재 감시중인 심볼 전체 반환 (관리자 패널 용)
-    return {"watched_symbols": list(watched_symbols), "active_threads": list(symbol_threads.keys()), "cache_symbols": list(data_cache.keys())}
+    return {
+        "watched_symbols": list(watched_symbols),
+        "active_threads": list(symbol_threads.keys()),
+        "cache_symbols": list(data_cache.keys())
+    }
 
 @app.post("/monitor/add")
-def add_monitor(symbol: str):
+def add_symbol(symbol: str):
     start_symbol_thread(symbol)
-    return {"ok": True, "msg": f"Added {symbol}"}
+    return {"result": "added", "watched": list(watched_symbols)}
 
 @app.delete("/monitor/remove")
-def remove_monitor(symbol: str):
-    stop_symbol_thread(symbol)
-    return {"ok": True, "msg": f"Removed {symbol}"}
+def remove_symbol(symbol: str):
+    watched_symbols.discard(symbol)
+    symbol_threads.pop(symbol, None)
+    data_cache.pop(symbol, None)
+    return {"result": "removed", "watched": list(watched_symbols)}
 
-# ======== WebSocket 엔드포인트 ========
+# ==== WebSocket 관리 ====
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
-
     async def connect(self, websocket: WebSocket, symbol: str):
         await websocket.accept()
         if symbol not in self.active_connections:
             self.active_connections[symbol] = []
         self.active_connections[symbol].append(websocket)
-
     def disconnect(self, websocket: WebSocket, symbol: str):
         if symbol in self.active_connections:
             self.active_connections[symbol].remove(websocket)
             if not self.active_connections[symbol]:
                 del self.active_connections[symbol]
-
     async def broadcast(self, symbol: str, data: dict):
         if symbol in self.active_connections:
             for ws in list(self.active_connections[symbol]):
@@ -226,8 +244,8 @@ manager = ConnectionManager()
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket, symbol: str = "TQQQ"):
     await manager.connect(websocket, symbol)
-    start_symbol_thread(symbol)
     try:
+        start_symbol_thread(symbol)
         last_sent = None
         while True:
             await asyncio.sleep(2)
