@@ -213,9 +213,7 @@ def update_cache(symbol):
     last_cache = None
     while symbol in watched_symbols:
         try:
-            print(f"[{symbol}] get_data() 시작 ({time.strftime('%H:%M:%S')})")
             df = get_data(symbol, period="3d", interval="1m")
-            print(f"[{symbol}] get_data() 완료: df shape = {df.shape}")
             if not is_valid_data(df):
                 print(f"[{symbol}] 데이터 유효하지 않음. error_count={error_count+1}")
                 error_count += 1
@@ -224,7 +222,6 @@ def update_cache(symbol):
             error_count = 0
 
             df = calculate_indicators(df)
-            print(f"[{symbol}] 지표 계산 완료")
 
             signal_dict = detect_signals(df)
             backtest_result = backtest_signals(df, signal_dict)
@@ -242,8 +239,6 @@ def update_cache(symbol):
             }
             data_cache[symbol] = current_cache
             last_cache = current_cache
-            print(f"[{symbol}] cache update: {current_cache['last_updated']} / {current_cache['latest_price']}")
-
         except Exception as e:
             print(f"[update_cache] {symbol}: 예외 발생: {e}")
             error_count += 1
@@ -329,16 +324,11 @@ async def websocket_endpoint(websocket: WebSocket, symbol: str = "TQQQ"):
     await manager.connect(websocket, symbol)
     try:
         start_symbol_thread(symbol)
-        if symbol in data_cache:
-            await websocket.send_text(json.dumps(data_cache[symbol]))
-        last_sent = json.dumps(data_cache[symbol]) if symbol in data_cache else None
         while True:
             await asyncio.sleep(0.01)
             if symbol in data_cache:
                 current = json.dumps(data_cache[symbol], sort_keys=True)
-                if current != last_sent:
-                    await websocket.send_text(current)
-                    last_sent = current
+                await websocket.send_text(current)
     except WebSocketDisconnect:
         manager.disconnect(websocket, symbol)
     except Exception:
