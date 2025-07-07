@@ -30,7 +30,12 @@ class TradingSignalResponse(BaseModel):
 
 # ==== 분석 함수 ====
 def get_data(symbol: str) -> pd.DataFrame:
-    df = yf.download(symbol, period="10d", interval="1m", progress=False)
+    # Yahoo 정책상 1m interval은 7일 이하만 지원
+    try:
+        df = yf.download(symbol, period="7d", interval="1m", progress=False)
+    except Exception as e:
+        print(f"[get_data] Error for {symbol}: {e}")
+        df = pd.DataFrame()
     return df
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -79,7 +84,10 @@ def backtest_signals(df: pd.DataFrame, signals: Dict[str, List[str]]) -> pd.Data
     result = []
     df = df.copy()
     for idx in signals.keys():
-        i = df.index.get_loc(pd.Timestamp(idx))
+        try:
+            i = df.index.get_loc(pd.Timestamp(idx))
+        except Exception:
+            continue
         entry = df.iloc[i]
         entry_price = entry["Close"]
         entry_time = idx
@@ -105,7 +113,8 @@ def analyze_timeframes(symbol: str) -> List[str]:
     reports = []
     for interval, label in intervals:
         try:
-            df = yf.download(symbol, period="5d", interval=interval, progress=False)
+            period = "7d" if interval == "1m" else "10d"
+            df = yf.download(symbol, period=period, interval=interval, progress=False)
             df = calculate_indicators(df)
             sig = detect_signals(df)
             last_dt = str(df.index[-1]) if not df.empty else "?"
@@ -176,11 +185,13 @@ def update_cache(symbol):
                 data_cache[symbol] = current_cache
                 last_cache = current_cache
         except Exception as e:
+            print(f"[update_cache] {symbol}: 예외 발생: {e}")
             error_count += 1
         if error_count >= max_error_count:
             watched_symbols.discard(symbol)
             symbol_threads.pop(symbol, None)
             data_cache.pop(symbol, None)
+            print(f"[update_cache] {symbol}: 에러 카운트 초과, 감시 중단")
             break
         time.sleep(10)
 
