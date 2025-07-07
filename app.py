@@ -3,16 +3,14 @@ import pandas as pd
 import ta
 import threading
 import time
-import json
-import asyncio
-
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
+import asyncio
+import json
 
-# ==== 데이터 타입 정의 ====
-
+# ======== 데이터 타입 정의 ========
 class BacktestEntry(BaseModel):
     signal_time: str
     signals: List[str]
@@ -30,8 +28,65 @@ class TradingSignalResponse(BaseModel):
     mtf_report: List[str]
     last_updated: str
 
-# ==== 데이터 관리 ====
+# ======== 분석 함수 (간단 예시, 실제 분석 함수는 이전 코드 참고) ========
+def get_data(symbol: str) -> pd.DataFrame:
+    df = yf.download(symbol, period="7d", interval="1m")
+    return df
 
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # RSI, MACD 등 계산
+    if "Close" not in df:
+        return df
+    df = df.copy()
+    df["rsi"] = ta.momentum.rsi(df["Close"], window=14)
+    macd = ta.trend.macd_diff(df["Close"])
+    df["macd"] = macd
+    df["20ma"] = df["Close"].rolling(window=20).mean()
+    return df
+
+def detect_signals(df: pd.DataFrame) -> Dict[str, List[str]]:
+    signals = {}
+    for i in range(1, len(df)):
+        idx = df.index[i]
+        row = df.iloc[i]
+        row_prev = df.iloc[i-1]
+        sigs = []
+        if row["Close"] > row["20ma"] and row_prev["Close"] <= row_prev["20ma"]:
+            sigs.append("20MA 돌파 (매수)")
+        if row["Close"] < row["20ma"] and row_prev["Close"] >= row_prev["20ma"]:
+            sigs.append("20MA 이탈 (매도)")
+        if row["rsi"] is not None and row["rsi"] > 70:
+            sigs.append("과열 (RSI>70)")
+        if row["rsi"] is not None and row["rsi"] < 30:
+            sigs.append("침체 (RSI<30)")
+        if sigs:
+            signals[str(idx)] = sigs
+    return signals
+
+def backtest_signals(df: pd.DataFrame, signal_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    # 매우 단순 예시: 각 신호 발생시점 진입가/청산가를 기록
+    results = []
+    for t, sigs in signal_dict.items():
+        entry_idx = df.index.get_loc(pd.Timestamp(t))
+        entry_price = df.iloc[entry_idx]["Close"]
+        exit_idx = min(entry_idx + 5, len(df)-1)
+        exit_price = df.iloc[exit_idx]["Close"]
+        ret = (exit_price - entry_price) / entry_price
+        results.append({
+            "signal_time": str(df.index[entry_idx]),
+            "signals": sigs,
+            "entry_price": float(entry_price),
+            "exit_time": str(df.index[exit_idx]),
+            "exit_price": float(exit_price),
+            "ret": float(ret)
+        })
+    return pd.DataFrame(results)
+
+def analyze_timeframes(symbol: str) -> List[str]:
+    # 다중타임프레임 보고서 예시 (임의)
+    return [f"[{symbol}] 1분봉 강세", f"[{symbol}] 5분봉 약세"]
+
+# ======== 서버/캐시/쓰레드 관리 ========
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -44,129 +99,7 @@ app.add_middleware(
 data_cache = {}
 watched_symbols = set()
 symbol_threads = {}
-CACHE_INTERVAL = 5  # 초 (API 과다호출 방지, 실전 배포시 1~5초 권장)
-
-# ==== 데이터 함수 정의 ====
-
-def get_data(symbol, interval="1m", period="5d"):
-    """
-    yfinance에서 데이터 불러오기 (일반적 1분봉, 5일치)
-    """
-    df = yf.download(
-        tickers=symbol,
-        interval=interval,
-        period=period,
-        progress=False,
-        auto_adjust=True,
-        threads=False,
-    )
-    if not df.empty:
-        df.index = pd.to_datetime(df.index)
-    return df
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ta-lib 없이 pandas+ta 패키지로 주요 지표 추가
-    """
-    df = df.copy()
-    df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
-    macd = ta.trend.MACD(df["Close"])
-    df["MACD"] = macd.macd()
-    df["MACD_signal"] = macd.macd_signal()
-    df["20MA"] = df["Close"].rolling(window=20).mean()
-    bb = ta.volatility.BollingerBands(df["Close"], window=20, window_dev=2)
-    df["BB_upper"] = bb.bollinger_hband()
-    df["BB_lower"] = bb.bollinger_lband()
-    return df
-
-def detect_signals(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """
-    날짜별 신호 판별 (RSI, MACD, 볼린저밴드 등)
-    """
-    signals = {}
-    for i in range(1, len(df)):
-        idx = df.index[i]
-        row, prev = df.iloc[i], df.iloc[i - 1]
-        sigs = []
-
-        # 20MA 돌파/이탈
-        if prev["Close"] < prev["20MA"] and row["Close"] > row["20MA"]:
-            sigs.append("20MA 돌파 (매수)")
-        if prev["Close"] > prev["20MA"] and row["Close"] < row["20MA"]:
-            sigs.append("20MA 이탈 (매도)")
-
-        # MACD 골든/데드크로스
-        if prev["MACD"] < prev["MACD_signal"] and row["MACD"] > row["MACD_signal"]:
-            sigs.append("MACD 골든크로스 (매수)")
-        if prev["MACD"] > prev["MACD_signal"] and row["MACD"] < row["MACD_signal"]:
-            sigs.append("MACD 데드크로스 (매도)")
-
-        # RSI 과열/과매도
-        if row["RSI"] > 70:
-            sigs.append("과열 (RSI>70)")
-        if row["RSI"] < 30:
-            sigs.append("과매도 (RSI<30)")
-
-        # 볼린저밴드 상/하단 터치
-        if row["Close"] >= row["BB_upper"]:
-            sigs.append("볼린저밴드 상단 이탈")
-        if row["Close"] <= row["BB_lower"]:
-            sigs.append("볼린저밴드 하단 이탈")
-
-        if sigs:
-            signals[str(idx)] = sigs
-    return signals
-
-def backtest_signals(df: pd.DataFrame, signal_dict: Dict[str, List[str]]) -> pd.DataFrame:
-    """
-    간단 백테스트 (매수/매도 신호 후 5분 뒤 진입/청산 수익률 계산)
-    """
-    records = []
-    for idx, sigs in signal_dict.items():
-        i = df.index.get_loc(pd.to_datetime(idx))
-        entry_price = df.iloc[i]["Close"]
-        # 5분 뒤 청산(혹은 마지막 값)
-        exit_i = min(i + 5, len(df) - 1)
-        exit_price = df.iloc[exit_i]["Close"]
-        exit_time = df.index[exit_i]
-        ret = (exit_price - entry_price) / entry_price
-        records.append({
-            "signal_time": str(df.index[i]),
-            "signals": sigs,
-            "entry_price": float(entry_price),
-            "exit_time": str(exit_time),
-            "exit_price": float(exit_price),
-            "ret": float(ret),
-        })
-    return pd.DataFrame(records)
-
-def analyze_timeframes(symbol: str) -> List[str]:
-    """
-    다중 타임프레임 리포트 예시
-    """
-    report = []
-    # 1분봉
-    df_1m = get_data(symbol, interval="1m", period="2d")
-    df_1m = calculate_indicators(df_1m)
-    rsi_1m = df_1m["RSI"].iloc[-1] if not df_1m.empty else None
-    if rsi_1m is not None:
-        report.append(f"[1분] RSI {rsi_1m:.2f} {'과열' if rsi_1m > 70 else '과매도' if rsi_1m < 30 else ''}")
-
-    # 5분봉
-    df_5m = get_data(symbol, interval="5m", period="5d")
-    df_5m = calculate_indicators(df_5m)
-    rsi_5m = df_5m["RSI"].iloc[-1] if not df_5m.empty else None
-    if rsi_5m is not None:
-        report.append(f"[5분] RSI {rsi_5m:.2f} {'과열' if rsi_5m > 70 else '과매도' if rsi_5m < 30 else ''}")
-
-    # 1시간봉
-    df_1h = get_data(symbol, interval="60m", period="30d")
-    df_1h = calculate_indicators(df_1h)
-    rsi_1h = df_1h["RSI"].iloc[-1] if not df_1h.empty else None
-    if rsi_1h is not None:
-        report.append(f"[1시간] RSI {rsi_1h:.2f} {'과열' if rsi_1h > 70 else '과매도' if rsi_1h < 30 else ''}")
-
-    return report
+CACHE_INTERVAL = 10  # 초
 
 def is_valid_data(df):
     return (
@@ -180,7 +113,7 @@ def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
     error_count = 0
     max_error_count = 5
-    while True:
+    while symbol in watched_symbols:
         try:
             df = get_data(symbol)
             if not is_valid_data(df):
@@ -225,8 +158,14 @@ def start_symbol_thread(symbol):
     symbol_threads[symbol] = t
     t.start()
 
-# ==== REST 엔드포인트 ====
+def stop_symbol_thread(symbol):
+    watched_symbols.discard(symbol)
+    if symbol in symbol_threads:
+        symbol_threads.pop(symbol, None)
+    if symbol in data_cache:
+        data_cache.pop(symbol, None)
 
+# ======== REST API ========
 @app.get("/monitor", response_model=TradingSignalResponse)
 def monitor(symbol: str = Query("TQQQ")):
     start_symbol_thread(symbol)
@@ -242,8 +181,22 @@ def monitor(symbol: str = Query("TQQQ")):
         "last_updated": "",
     }
 
-# ==== WebSocket 엔드포인트 ====
+@app.get("/monitors")
+def monitors():
+    # 현재 감시중인 심볼 전체 반환 (관리자 패널 용)
+    return {"watched_symbols": list(watched_symbols), "active_threads": list(symbol_threads.keys()), "cache_symbols": list(data_cache.keys())}
 
+@app.post("/monitor/add")
+def add_monitor(symbol: str):
+    start_symbol_thread(symbol)
+    return {"ok": True, "msg": f"Added {symbol}"}
+
+@app.delete("/monitor/remove")
+def remove_monitor(symbol: str):
+    stop_symbol_thread(symbol)
+    return {"ok": True, "msg": f"Removed {symbol}"}
+
+# ======== WebSocket 엔드포인트 ========
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
@@ -271,15 +224,13 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.websocket("/ws/monitor")
-async def websocket_endpoint(websocket: WebSocket):
-    # 쿼리 파라미터에서 symbol 파싱
-    symbol = websocket.query_params.get("symbol", "TQQQ")
+async def websocket_endpoint(websocket: WebSocket, symbol: str = "TQQQ"):
     await manager.connect(websocket, symbol)
     start_symbol_thread(symbol)
     try:
         last_sent = None
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             if symbol in data_cache:
                 current = json.dumps(data_cache[symbol], sort_keys=True)
                 if current != last_sent:
@@ -289,5 +240,3 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket, symbol)
     except Exception:
         manager.disconnect(websocket, symbol)
-
-# -------- END --------
