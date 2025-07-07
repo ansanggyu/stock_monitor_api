@@ -141,13 +141,17 @@ symbol_threads: Dict[str, threading.Thread] = {}
 
 def update_cache(symbol):
     global data_cache, watched_symbols, symbol_threads
+    print(f"[update_cache] 쓰레드 시작: {symbol}")
     error_count = 0
     max_error_count = 3
     last_cache = None
     while symbol in watched_symbols:
+        print(f"[update_cache] {symbol}: get_data() 호출")
         try:
             df = get_data(symbol)
+            print(f"[update_cache] {symbol}: df shape: {df.shape}")
             if not is_valid_data(df):
+                print(f"[update_cache] {symbol}: 데이터 유효하지 않음")
                 error_count += 1
                 time.sleep(3)
                 continue
